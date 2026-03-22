@@ -12,40 +12,57 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "User-Agent": "Mozilla/5.0",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "application/json",
     "Referer": "https://www.nseindia.com/report-detail/display-bulk-and-block-deals"
 }
 
-# ───────────────── NSE FETCH ─────────────────
+# ───────────────── NSE FETCH (BULK + BLOCK) ─────────────────
 def fetch_nse():
     today = datetime.today().strftime("%d-%m-%Y")
-    url = f"https://www.nseindia.com/api/bulk-deals?from={today}&to={today}"
+
+    bulk_url = f"https://www.nseindia.com/api/bulk-deals?from={today}&to={today}"
+    block_url = f"https://www.nseindia.com/api/block-deals?from={today}&to={today}"
 
     session = requests.Session()
 
-    # Step 1: get cookies
+    # Step 1: Initialize cookies
     homepage = session.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
-
     if homepage.status_code != 200:
         raise Exception("NSE session init failed")
 
     time.sleep(1.5)
 
-    # Step 2: fetch data
-    response = session.get(url, headers=HEADERS, timeout=10)
+    # Step 2: Fetch BULK deals
+    bulk_resp = session.get(bulk_url, headers=HEADERS, timeout=10)
+    if bulk_resp.status_code != 200:
+        raise Exception("Bulk deals fetch failed")
 
-    if response.status_code != 200:
-        print("NSE Status:", response.status_code)
-        print("Response:", response.text[:200])
-        raise Exception("NSE fetch failed")
+    bulk_data = bulk_resp.json().get("data", [])
 
-    data = response.json()
-    return data.get("data", [])
+    time.sleep(1)
+
+    # Step 3: Fetch BLOCK deals
+    block_resp = session.get(block_url, headers=HEADERS, timeout=10)
+    if block_resp.status_code != 200:
+        raise Exception("Block deals fetch failed")
+
+    block_data = block_resp.json().get("data", [])
+
+    print(f"NSE Bulk: {len(bulk_data)}, Block: {len(block_data)}")
+
+    # Tag deal category
+    for row in bulk_data:
+        row["deal_category"] = "BULK"
+
+    for row in block_data:
+        row["deal_category"] = "BLOCK"
+
+    return bulk_data + block_data
 
 
-# ───────────────── BSE FALLBACK ─────────────────
+# ───────────────── BSE FETCH (FALLBACK) ─────────────────
 def fetch_bse():
     print("Fetching from BSE...")
 
@@ -64,12 +81,17 @@ def fetch_bse():
     if response.status_code != 200:
         raise Exception("BSE fetch failed")
 
-    data = response.json()
+    data = response.json().get("Table", [])
 
-    return data.get("Table", [])
+    # Tag category (BSE gives both together)
+    for row in data:
+        deal_type = row.get("BUY_SELL", "").upper()
+        row["deal_category"] = "BLOCK" if "BLOCK" in deal_type else "BULK"
+
+    return data
 
 
-# ───────────────── RETRY WRAPPER ─────────────────
+# ───────────────── RETRY ─────────────────
 def fetch_with_retry():
     for i in range(3):
         try:
@@ -82,7 +104,7 @@ def fetch_with_retry():
     raise Exception("All NSE retries failed")
 
 
-# ───────────────── MAIN FETCH ROUTER ─────────────────
+# ───────────────── FETCH ROUTER ─────────────────
 def fetch_data():
     try:
         return fetch_with_retry(), "NSE"
@@ -108,6 +130,7 @@ def transform_data(raw, source):
             "tradePrice": "price",
             "date": "trade_date"
         })
+
         df["exchange"] = "NSE"
 
     else:  # BSE
@@ -120,20 +143,30 @@ def transform_data(raw, source):
             "PRICE": "price",
             "DEAL_DATE": "trade_date"
         })
+
         df["exchange"] = "BSE"
 
+    # Ensure deal_category exists
+    if "deal_category" not in df.columns:
+        df["deal_category"] = "UNKNOWN"
+
+    # Convert date
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
 
-    df = df[[
-        "symbol",
-        "security_name",
-        "client_name",
-        "deal_type",
-        "quantity",
-        "price",
-        "trade_date",
-        "exchange"
-    ]]
+    # Final columns
+    df = df[
+        [
+            "symbol",
+            "security_name",
+            "client_name",
+            "deal_type",
+            "deal_category",
+            "quantity",
+            "price",
+            "trade_date",
+            "exchange",
+        ]
+    ]
 
     print("Transformed rows:", len(df))
 
@@ -148,7 +181,7 @@ def load_to_supabase(records):
 
     response = supabase.table("bulk_block_deals").upsert(
         records,
-        on_conflict="symbol,client_name,trade_date,deal_type"
+        on_conflict="symbol,client_name,trade_date,deal_type,deal_category"
     ).execute()
 
     print("Inserted/Upserted:", len(records))
