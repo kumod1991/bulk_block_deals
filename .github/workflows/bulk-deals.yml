@@ -2,7 +2,7 @@ name: Bulk Block Deals ETL
 
 on:
   schedule:
-    - cron: "30 14 * * 1-5"   # 8 PM IST
+    - cron: "40 12 * * 1-5"   # 8 PM IST
   workflow_dispatch:
 
 jobs:
